@@ -11040,6 +11040,10 @@ async function renderReportDetail(domain) {
         ${statusFilters}
       </div>
       <input type="search" class="report-search" placeholder="Search subdomains…" data-sub-search />
+      <div style="display: flex; gap: 6px; margin-left: auto; align-items: center; flex-shrink: 0;">
+        <button class="btn small secondary" id="report-detail-export-txt" title="Export filtered subdomains as plain text">Export TXT</button>
+        <button class="btn small secondary" id="report-detail-export-csv" title="Export filtered subdomains as CSV">Export CSV</button>
+      </div>
     </div>
     <div class="table-wrapper">
       <table class="targets-table" id="subdomains-table">
@@ -11134,6 +11138,37 @@ async function renderReportDetail(domain) {
   attachSubdomainFilters(detail);
   attachSeverityFilter(detail.querySelector('[data-nuclei-filter]'), detail.querySelector('#nuclei-table'));
   attachSeverityFilter(detail.querySelector('[data-nikto-filter]'), detail.querySelector('#nikto-table'));
+  
+  // Wire up per-report subdomain export buttons
+  const exportTxtBtn = detail.querySelector('#report-detail-export-txt');
+  const exportCsvBtn = detail.querySelector('#report-detail-export-csv');
+  const buildReportExportURL = (format) => {
+    const statusGroup = detail.querySelector('[data-status-filter]');
+    const searchInput = detail.querySelector('[data-sub-search]');
+    const params = new URLSearchParams();
+    params.set('domain', domain);
+    const subSearch = (searchInput && searchInput.value || '').trim();
+    if (subSearch) params.set('subSearch', subSearch);
+    const activeCodes = statusGroup
+      ? Array.from(statusGroup.querySelectorAll('input[type="checkbox"]'))
+          .filter(cb => cb.checked).map(cb => cb.value)
+      : [];
+    const allCodes = statusGroup
+      ? Array.from(statusGroup.querySelectorAll('input[type="checkbox"]'))
+          .map(cb => cb.value)
+      : [];
+    if (activeCodes.length && activeCodes.length < allCodes.length) {
+      params.set('statusCodes', activeCodes.join(','));
+    }
+    return `/api/export/subdomains/${format}?${params.toString()}`;
+  };
+  if (exportTxtBtn) {
+    exportTxtBtn.addEventListener('click', () => window.open(buildReportExportURL('txt'), '_blank'));
+  }
+  if (exportCsvBtn) {
+    exportCsvBtn.addEventListener('click', () => window.open(buildReportExportURL('csv'), '_blank'));
+  }
+  
   hydrateCommandLog(domain);
   updateReportNavSelection();
 }
@@ -12902,6 +12937,11 @@ def filter_domains_by_criteria(state: Dict[str, Any], filters: Dict[str, Any]) -
     filtered_domains = []
     
     for domain, info in targets.items():
+        # Exact single-domain filter (per-report export)
+        if filters.get("domain"):
+            if domain != filters["domain"]:
+                continue
+        
         # Domain search filter
         if filters.get("domainSearch"):
             if filters["domainSearch"].lower() not in domain.lower():
@@ -12943,6 +12983,23 @@ def filter_domains_by_criteria(state: Dict[str, Any], filters: Dict[str, Any]) -
     return filtered_domains
 
 
+def _subdomain_matches_filters(subdomain: str, sub_data: Dict[str, Any], filters: Dict[str, Any]) -> bool:
+    """Return True if a subdomain passes subdomain-level export filters."""
+    sub_search = filters.get("subSearch", "")
+    if sub_search and sub_search.lower() not in subdomain.lower():
+        return False
+    
+    status_codes = filters.get("statusCodes", "")
+    if status_codes and status_codes != "all":
+        allowed = set(c.strip() for c in status_codes.split(",") if c.strip())
+        httpx = sub_data.get("httpx", {})
+        code = str(httpx.get("status_code", "")) if httpx.get("status_code") else "none"
+        if allowed and code not in allowed:
+            return False
+    
+    return True
+
+
 def export_subdomains_txt(state: Dict[str, Any], filters: Dict[str, Any]) -> bytes:
     """Export subdomains as plain text, one per line, respecting filters."""
     filtered_domains = filter_domains_by_criteria(state, filters)
@@ -12952,7 +13009,9 @@ def export_subdomains_txt(state: Dict[str, Any], filters: Dict[str, Any]) -> byt
     for domain in filtered_domains:
         info = targets.get(domain, {})
         subs = info.get("subdomains", {})
-        subdomains.extend(sorted(subs.keys()))
+        for sub, sub_data in sorted(subs.items()):
+            if _subdomain_matches_filters(sub, sub_data, filters):
+                subdomains.append(sub)
     
     # Remove duplicates and sort
     unique_subdomains = sorted(set(subdomains))
@@ -12974,6 +13033,8 @@ def export_subdomains_csv(state: Dict[str, Any], filters: Dict[str, Any]) -> byt
         
         for subdomain in sorted(subs.keys()):
             sub_data = subs[subdomain]
+            if not _subdomain_matches_filters(subdomain, sub_data, filters):
+                continue
             httpx = sub_data.get("httpx", {})
             status_code = httpx.get("status_code", "")
             title = httpx.get("title", "")
@@ -15719,11 +15780,14 @@ form.addEventListener('submit', async (e) => {
             
             # Extract filter parameters
             filters = {
+                "domain": query_params.get("domain", [""])[0],
                 "domainSearch": query_params.get("domainSearch", [""])[0],
                 "status": query_params.get("status", ["all"])[0],
                 "maxSeverity": query_params.get("maxSeverity", ["all"])[0],
                 "hasFindings": query_params.get("hasFindings", ["false"])[0].lower() == "true",
                 "hasScreenshots": query_params.get("hasScreenshots", ["false"])[0].lower() == "true",
+                "subSearch": query_params.get("subSearch", [""])[0],
+                "statusCodes": query_params.get("statusCodes", [""])[0],
             }
             
             # Determine format from path
